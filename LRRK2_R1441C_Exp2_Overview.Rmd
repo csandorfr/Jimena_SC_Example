@@ -1,0 +1,892 @@
+---
+title: "Single cell RNAseq from iPSC-derived dopaminergic neurons of patients with Parkinson's disease carrying the R1441C LRRK2 mutation"
+author: "J Monzón Sandoval"
+date: 'Last update: `r date()`'
+output: 
+  html_document:
+    theme: journal
+    toc: yes
+    number_sections: true
+    toc_float:
+      collapsed: yes
+      smooth_scroll: yes
+---
+
+# Data preparation
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = FALSE)
+
+```
+
+```{r libfun, message=FALSE}
+
+library(switchde)
+library(cellity)
+library(scater)
+library(corrgram)
+library(RColorBrewer)
+library(pheatmap)
+library(ggplot2)
+library(ggsci)
+library(stringr)
+library(cowplot)
+library(tximport)
+library(tximportData)
+library(DT)
+
+# Functions #
+# Filter tx object #
+filtrado <- function(tx_object, genelist){
+  tx_object_filtered <- tx_object
+  rem <- match(genelist, rownames(tx_object_filtered$abundance))
+  tx_object_filtered$abundance <- tx_object[[1]][rem, ]
+  tx_object_filtered$counts <- tx_object[[2]][rem, ]
+  tx_object_filtered$length <- tx_object[[3]][rem, ]
+  return(tx_object_filtered)
+}
+
+# TPM_matrix from tx object #
+TPM_from_tx <- function(tx_import_object){
+  countsbylength <- tx_import_object$counts/tx_import_object$length
+  total_countsbylength <- colSums(countsbylength)
+  data_TPM <- t(apply(countsbylength, 1, function(x) x / total_countsbylength * 1000000))
+  colnames(data_TPM) <- colnames(tx_import_object$counts)
+  return(data_TPM)
+}
+
+```
+
+## Metadata
+
+```{r phenodata}
+
+t0 <- read.table("./01_QC/sample_level_info.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+t1 <- read.table("./01_QC/P1803335-H5GMCBBXY-QC.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+
+# Standarize group labels.
+gp <- sapply(str_split(t0$Sample.name, "\\."), "[", 1)
+gp <- str_replace(string = gp, pattern = "Control1841", replacement = "Control")
+gp <- str_replace(string = gp, pattern = "LRRK23870", replacement = "LRRK2_R1441C")
+gp[str_detect(string = gp, pattern = "3pgmousecontrol")] <- "3PGMouseControl"
+gp[str_detect(string = gp, pattern = "Blank")] <- "Blank"
+gp[str_detect(string = gp, pattern = "singlecelllysatecontrol")] <- "SingleCellLysateCtrl"
+t0 <- data.frame(t0, Group = gp)
+
+# Split Median Insert Size from SD
+median_insert_size <- as.numeric(sapply(str_split(string = t1$`Median.Isize..Â..MAD.`, pattern = " Â± "), "[", 1))
+median_insert_size_MAD <- as.numeric(sapply(str_split(string = t1$`Median.Isize..Â..MAD.`, pattern = " Â± "), "[", 2))
+t1 <- data.frame(t1, MedianInsertSize = median_insert_size, MedianInsertSizeMAD = median_insert_size_MAD)
+
+# Aggregate data by Mx/sample/Index
+t2 <- aggregate(x = t1[, c("Yield..Mb.", "Yield..Mb.Q30.", "X..Mapped", "X..MapQ...4", "X..UTR", 
+                           "X..Exonic", "X..dups", "X..pair.dups", "X..Variants", "MIX", "X.LK1.LK0.", 
+                           "X..M.F..Kmer", "X..GC", "Avg.Q", "MedianInsertSize", "MedianInsertSizeMAD")], 
+                by = list(t1$Mx), FUN = mean)
+colnames(t2)[1] <- "Index"
+
+# Merge tables and add total number of reads in file.
+t3 <- merge(t0, t2, by = "Index")
+t4 <- read.table("./01_QC/number_of_reads.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+t5 <- merge(t3, t4, by = "Index")
+
+# Metadata (Geneder / Age / Patient ID)
+t6 <- read.table(file = "../PD_LRRK2_R1441C_bulk/04_Pheno/Pheno_data_v3.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+t6 <- t6[which(t6$age < 40), c("group", "patient_ID", "age", "sex", "reprogramming")]
+t7 <- merge(t5, t6, by.x = "Group", by.y = "group", all.x = TRUE)
+
+t8 <- read.table("./00_Data/Sample_WellLocation.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+t9 <- merge(t7, t8, by.x = "Sample.name", by.y = "Sample_ID")
+
+pheno <- t9[order(t9$Index), ]
+rownames(pheno) <- 1:nrow(pheno)
+colnames(pheno) <- str_replace(str_replace(str_replace(str_replace_all(colnames(pheno), "\\.", "_"), "X_", ""), "__", "_"), "^_", "")
+
+rm(t0, t1, gp, median_insert_size, median_insert_size_MAD, t2, t3, t4, t5, t6, t7, t8, t9)
+
+```
+
+```{r phenotable}
+
+DT::datatable(unique(pheno[, c("Group", "patient_ID", "age", "sex", "reprogramming")]), rownames = FALSE, caption = "Metadata", escape = FALSE, extensions = 'Buttons', options = list(dom = 'Btr', buttons = c('csv'), pageLength = 15))
+
+```
+
+```{r samplegroup}
+
+data.frame(Samples = table(pheno$Group))
+
+```
+
+```{r phenoCorr, fig.height=10, fig.width=10}
+
+panel.pts2 <- function (x, y, corr = NULL, col.regions, cor.method, ...){
+    if (!is.null(corr)) 
+        return()
+    plot.xy(xy.coords(x, y), type = "p", pch = 16, cex = .7, col = alpha("grey20", .5), ...)
+    box(col = "lightgray")
+}
+
+corrgram(x = pheno[, c("GC_x", "Exonic_x", "Yield_Mb_", "Yield_Mb_Q30_", "Mapped", "MapQ__4", "UTR",
+                       "dups", "M_F_Kmer", "Avg_Q", "MedianInsertSize", 
+                       "MedianInsertSizeMAD", "Reads")], 
+         upper.panel = panel.cor, lower.panel = panel.pts2, cex.labels = 1.2, label.srt = 45, gap = .2)
+rm(panel.pts2)
+
+```
+
+```{r ggpheno}
+v2p <- c("Reads", "GC_x", "Exonic_x", "Yield_Mb_", "Yield_Mb_Q30_", "Mapped", "MapQ__4", "UTR", "dups", 
+         "Variants", "M_F_Kmer", "Avg_Q", "MedianInsertSize", "MedianInsertSizeMAD")
+v2pn <- c("Reads", "% GC", "% Exonic", "Yield (Mb)",  "Yield (Mb, Q30)", "% Mapped", "% MapQ > 4", "% UTR", "% dups", 
+          "% Variants", "% MF Kmer", "Avg Q", "Median Insert Size", "Median Insert Size MAD")
+
+for (i in c(1:length(v2p))){
+  gg0 <- ggplot(data = pheno, mapping = aes_string(x = "Group", y = v2p[i], fill = "Group", col = "Mapped")) + geom_violin() + geom_jitter(width = .2) + scale_fill_manual(values = c("cyan", "grey", pal_igv()(2), "orange")) +  scale_color_gradient2(low = "snow", high = "black") + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + ylab(label = v2pn[i])
+  assign(x = paste("gg", i, sep = ""), value = gg0)
+  rm(gg0)
+}
+rm(i)
+
+```
+
+```{r phenogg, fig.height=30, fig.width=12}
+
+plot_grid(gg1, gg2, gg3, gg4, gg5, gg6, gg7, gg8, gg9, gg10, gg11, gg12, gg13, gg14, ncol = 2)
+rm(gg1, gg2, gg3, gg4, gg5, gg6, gg7, gg8, gg9, gg10, gg11, gg12, gg13, gg14)
+
+```
+
+## Transcript abundances 
+
+```{r GEdata}
+
+anots <- read.table("./02_Index/Annotation_Homo_sapiens.GRCh38.cdna.ncrna.rmCHR.txt", sep ="\t", header = TRUE)
+# Remove transcript version and repetitive info (gene_symbol).
+anots[, 4] <- sapply(str_split(anots$GENE, "[:]"), "[", 2)
+anots[, 5] <- sapply(str_split(anots$GENE_BIOTYPE, "[:]"), "[", 2)
+anots[, 6] <- sapply(str_split(anots$TRANSCRIPT_BIOTYPE, "[:]"), "[", 2)
+anots[, 7] <- sapply(str_split(anots$GENE_SYMBOL, "[:]"), "[", 2)
+anots[, 8] <- sapply(str_split(anots$DESCRIPTION, " \\["), "[", 1)
+
+
+# Transcript to gene annotation #
+transcript2gene <- anots[, c(1, 4)]
+transcript2gene[which(str_detect(string = anots$ID, pattern = "^ERCC") == TRUE), 2] <- as.character(anots$ID[which(str_detect(string = anots$ID, pattern = "^ERCC") == TRUE)])
+
+# Per gene TPM values and estimated counts from Kallisto
+KF <- list.files(path = "./03_Counts", pattern = "abundance.h5", recursive = TRUE, full.names = TRUE)
+Index <- as.numeric(sapply(str_split(sapply(str_split(KF, "\\/"), "[", 3), "_"), "[", 3))
+
+# Check samples are in the same order than pheno
+if(unique(names(table(Index == pheno$Index))) == TRUE) { cat("Samples are in the correct order\n\n") }
+tx_gene <- tximport(KF, type =  "kallisto", txOut = FALSE, tx2gene = transcript2gene, ignoreTxVersion = FALSE)
+
+
+# All genes - Except those not expressed across all samples 
+keep_gene <- names(which(apply(tx_gene$abundance, 1, function(x) length(which(x == 0))) < dim(tx_gene$abundance)[2])) # remove complete zeros
+All_biotypes <- filtrado(tx_object = tx_gene, genelist = keep_gene)
+
+# Mitochondrial genes / percent
+mito.genes <- grep(pattern = "^MT-", x = anots$GENE_SYMBOL[match(x = rownames(All_biotypes$counts), table = anots$GENE)], value = TRUE)
+# L ribosomal proteins
+rpl.genes <- grep(pattern = "RPL", x = anots$GENE_SYMBOL[match(x = rownames(All_biotypes$counts), table = anots$GENE)], value = TRUE)
+#rpl.mito.genes <- rpl.genes[str_detect(rpl.genes, "MRPL")] # Separate mitochondrial genes 
+rpl.genes <- rpl.genes[which(str_detect(rpl.genes, "MRPL") == FALSE)]
+# S ribosomla proteins
+rps.genes <- grep(pattern = "RPS", x = anots$GENE_SYMBOL[match(x = rownames(All_biotypes$counts), table = anots$GENE)], value = TRUE)
+#rps.mito.genes <- rps.genes[str_detect(rps.genes, "MRPS")] # Separate mitochondrial genes 
+rps.genes <- rps.genes[which(str_detect(rps.genes, "MRPS") == FALSE)]
+# Total ribosomal proteins 
+ribo.genes <- union(rpl.genes, rps.genes)
+
+mito.genes <- anots$GENE[match(x = mito.genes, table = anots$GENE_SYMBOL)]
+ribo.genes <- anots$GENE[match(x = ribo.genes, table = anots$GENE_SYMBOL)]
+ERCCs <- grep(pattern = "ERCC", x = rownames(All_biotypes$counts), value = TRUE)
+rm(rpl.genes, rps.genes)
+
+# Protein coding gene only
+protein_coding <- anots$GENE[which(anots$TRANSCRIPT_BIOTYPE == "protein_coding")]
+keep_gene2 <- intersect(keep_gene, protein_coding)
+#ProteinCoding <- filtrado(tx_object = tx_gene, genelist = keep_gene2)
+
+# Protein coding, plus MT, plus Ribo, plus ERCCs.
+keep_gene3 <- unique(c(keep_gene2, mito.genes, ribo.genes, ERCCs))  
+PCMRE <- filtrado(tx_object = tx_gene, genelist = keep_gene3)
+
+rm(KF, Index, tx_gene, keep_gene, keep_gene2, keep_gene3, protein_coding)
+
+```
+
++ We used kallisto (version kallisto_linux-v0.43.0) to create a reference index and estimate transcript abundances.
+
++ We downloaded the human reference transcriptome from Ensembl (release 95) including cdna and ncrna sequences:
+
+  ftp://ftp.ensembl.org/pub/release-95/fasta/homo_sapiens/cdna/Homo_sapiens.GRCh38.cdna.all.fa.gz
+  ftp://ftp.ensembl.org/pub/release-95/fasta/homo_sapiens/ncrna/Homo_sapiens.GRCh38.ncrna.fa.gz
+
++ We removed sequences in scaffolds and kept only chromosomes 1, 2, ..., 22, X and Y.
+
++ We have included ERCC sequences when creating the reference index (ERCC.fa.gz)
+
++ All annotations from transcript and genes are in the following file: "Annotation_Homo_sapiens.GRCh38.cdna.ncrna.rmCHR.txt".
+
++ Features with **zero expression across all samples have been removed**.
+
++ Gene-level TPM (transcripts per million) estimates represent the overall transcriptional output of each gene
+
++ We filtered out 2 sets: one including all gene biotypes  **All_biotypes**, and the other including only protein coding genes, plus control features (ribo.genes, mito.genes, ERCCs) **PCMRE**
+
+# Transcript types
+
+## Counts per gene biotype 
+
+```{r}
+
+biotipos <- unique(anots$GENE_BIOTYPE)
+output <- matrix(NA, nrow = length(biotipos), ncol = ncol(All_biotypes$counts), dimnames = list(biotipos, pheno$Sample_name))
+
+for(i in c(1:length(biotipos))){
+  gi <- anots$GENE[which(anots$GENE_BIOTYPE == biotipos[i])]
+  gi <- intersect(gi, rownames(All_biotypes$counts))
+  if(length(gi) > 1){
+    output[i, ] <- unlist(apply(All_biotypes$counts[gi, ], 2, sum))
+  } else {
+    output[i, ] <- 0
+  }
+  if(length(gi) == 1){
+    output[i, ] <- All_biotypes$counts[gi, ]
+  }
+}
+rm(gi, i, biotipos)
+
+```
+
++ Sum of the raw counts per gene biotype
+
+```{r fig.height=7, fig.width=10}
+
+ph_anot <- pheno
+rownames(ph_anot) <- ph_anot$Sample_name
+
+pheatmap(output[names(table(anots$GENE_BIOTYPE))[order(table(anots$GENE_BIOTYPE), decreasing = TRUE)], ], 
+         annotation_col = ph_anot[, rev(c("Group", "Reads", "Mapped", "Exonic_x", "GC_x", "UTR", "M_F_Kmer", "MedianInsertSize"))], 
+         show_colnames = FALSE, fontsize_row = 8, cluster_rows = FALSE, 
+         col = colorRampPalette(brewer.pal(n = 7, name = "PuRd"))(100))
+
+```
+
+## Log10 counts per biotype
+
++ Sum of the raw counts per gene biotype.
+
++ The sums are then log transformed log10(counts + 1).
+
+```{r fig.height=7, fig.width=10}
+
+pheatmap(log10(output[ names(table(anots$GENE_BIOTYPE))[order(table(anots$GENE_BIOTYPE), decreasing = TRUE)], ] + 1), 
+         annotation_col = ph_anot[, rev(c("Group", "Reads", "Mapped", "Exonic_x", "GC_x", "UTR", "M_F_Kmer", "MedianInsertSize"))], 
+         show_colnames = FALSE, fontsize_row = 8, cluster_rows = FALSE,
+         col = colorRampPalette(brewer.pal(n = 7, name = "PuRd"))(100))
+
+```
+
+```{r}
+
+rm(output, ph_anot)
+
+```
+
+
+# Single cell gene expression object
+
+```{r}
+
+# Feature annotation
+fd <- unique(anots[, c("GENE", "GENE_SYMBOL", "DESCRIPTION")])
+fd <- fd[-nrow(fd), ] # NA caused by ERCCs
+fd_ercc <- data.frame(GENE = ERCCs, GENE_SYMBOL = ERCCs, DESCRIPTION = NA) 
+fd <- rbind(fd, fd_ercc)
+rownames(fd) <- fd$GENE
+fd <- fd[rownames(PCMRE$counts), ]
+
+colnames(PCMRE$counts) <- pheno$Sample.name
+
+# Single cell dataset
+sce <- SingleCellExperiment(assays = list(counts = PCMRE$counts), colData = pheno)
+rowData(sce) <- fd
+
+# Calculate QC 
+sce <- calculateQCMetrics(sce, 
+                          feature_controls = list(ERCCs = ERCCs, Mito = mito.genes, Ribo = ribo.genes), 
+                          cell_controls =  list(control = !(sce$Group %in% "Control" | sce$Group %in% "LRRK2_R1441C")))
+
+sce <- normalize(sce)
+cpm(sce) <- calculateCPM(sce)
+tpm(sce) <- calculateTPM(sce)
+
+#genes_detected_1TPM <- apply(X = tpm(sce), MARGIN = 2, FUN = function(x) length(which(x > 1)))
+#genes_detected_5TPM <- apply(X = tpm(sce), MARGIN = 2, FUN = function(x) length(which(x > 5)))
+
+rm(fd, fd_ercc)
+
+```
+
++  Gene expression data: `r ncol(sce)` cells and `r nrow(sce)` features
+
+# Plate layout
+
+## Plate 1
+
+```{r fig.height=4, fig.width=8}
+
+gg1 <- plotPlatePosition(sce[, sce$Plate == 1], plate_position = sce$WellLocation[sce$Plate == 1], colour_by = "Group", point_size = 9)
+gg1 <- gg1 + scale_fill_manual(values = c("cyan", "grey", pal_igv()(2), "orange"))
+gg1
+rm(gg1)
+
+#plotPlatePosition(sce, plate_position = sce$WellLocation, colour_by = "pct_counts_endogenous", point_size = 9)
+
+```
+
+## Plate 2
+
+
+```{r fig.height=4, fig.width=5}
+
+gg1 <- plotPlatePosition(sce[, sce$Plate == 2], plate_position = sce$WellLocation[sce$Plate == 2], colour_by = "Group", point_size = 9)
+gg1 <- gg1 + scale_fill_manual(values = c("cyan",  pal_igv()(2), "grey"))
+gg1
+rm(gg1)
+
+#plotPlatePosition(sce, plate_position = sce$WellLocation, colour_by = "pct_counts_endogenous", point_size = 9)
+
+```
+
+# QC features histograms
+
+```{r results='asis', fig.height=10, fig.width=12}
+
+par(mfrow = c(3, 4))
+for(i in c(7:ncol(colData(sce)))){
+  fi <- colData(sce)[, i]
+  if(is.numeric(fi)){
+    hist(fi, 20, border = "snow", col = alpha("grey", .9), main = "", 30, xlab = colnames(colData(sce))[i])
+    legend("top", legend = c(paste("median = ", signif(median(fi), 3)), paste("mean = ", signif(mean(fi), 3))), bty = "n")
+    #plot(density(fi), main = "", xlab = colnames(colData(sce))[i])
+  }else{
+    cat("\n\n + ", colnames(colData(sce))[i], levels(fi), table(fi), "\n \n")
+  }
+}
+
+```
+
+# Library complexity
+
+```{r fig.height=3, fig.width=9}
+plotScater(sce, block1 = "Group", colour_by = "total_features_by_counts", nfeatures = 50, exprs_values = "counts", ncol = 5)
+
+plotScater(sce, block1 = "Group", colour_by = "pct_counts_endogenous", nfeatures = 50, exprs_values = "counts", ncol = 5)
+
+plotScater(sce, block1 = "Group", colour_by = "pct_counts_ERCCs", nfeatures = 50, exprs_values = "counts", ncol = 5)
+
+plotScater(sce, block1 = "Group", colour_by = "Exonic_x", nfeatures = 50, exprs_values = "counts", ncol = 5)
+
+plotScater(sce, block1 = "Group", colour_by = "Mapped", nfeatures = 50, exprs_values = "counts", ncol = 5)
+
+plotScater(sce, block1 = "Group", colour_by = "pct_counts_Mito", nfeatures = 50, exprs_values = "counts", ncol = 5)
+
+plotScater(sce, block1 = "Group", colour_by = "pct_counts_Ribo", nfeatures = 50, exprs_values = "counts", ncol = 5)
+
+plotScater(sce, block1 = "Group", colour_by = "Reads", nfeatures = 50, exprs_values = "counts", ncol = 5)
+
+plotScater(sce, block1 = "Group", colour_by = "Plate", nfeatures = 50, exprs_values = "counts", ncol = 5)
+```
+
+
+# Mean expression vs. percentage of expressing cells
+
+```{r fig.height=4, fig.width=6, message=FALSE}
+
+gg <- plotExprsFreqVsMean(sce)
+
+gg0 <- plotExprsFreqVsMean(sce, controls = "is_feature_control_ERCCs")
+gg0 <- gg0 + scale_color_manual(values = c("grey", "black")) + theme(aspect.ratio = 1)
+
+gg1 <- plotExprsFreqVsMean(sce, controls = "is_feature_control_Mito")
+gg1 <- gg1 + scale_color_manual(values = c("grey", "green4")) + theme(aspect.ratio = 1)
+
+gg2 <- plotExprsFreqVsMean(sce, controls = "is_feature_control_Ribo")
+gg2 <- gg2 + scale_color_manual(values = c("grey", "red3")) + theme(aspect.ratio = 1)
+
+gg
+gg0
+gg1
+gg2
+
+rm(gg, gg0, gg1, gg2)
+```
+
+
+
+# Top expressed features 
+
+```{r fig.height=12, fig.width=12, message=FALSE}
+
+p1 <- plotHighestExprs(sce, n = 50, feature_names_to_plot = "GENE_SYMBOL", colour_cells_by = "Group")
+p1 <- p1 + scale_color_manual(values = c("cyan", "grey", pal_igv()(2), "orange"))
+
+p2 <- plotHighestExprs(sce[!rowData(sce)[, "is_feature_control"], !sce$is_cell_control], n = 50, feature_names_to_plot = "GENE_SYMBOL", colour_cells_by = "Group")
+p2 <- p2 + scale_color_igv()
+
+plot_grid(p1, p2, ncol = 2)
+rm(p1, p2)
+
+```
+
+
+# PCA 
+
+```{r}
+
+features4PC <- 4000
+
+```
+
++ PCA on the top `r features4PC` most variable features, including **all** samples.
+
+```{r}
+
+sce <- runPCA(sce, ncomponents = 10, method = "prcomp", ntop = features4PC, exprs_values = "logcounts")
+
+```
+
+
+```{r fig.height=8, fig.width=9}
+
+plotPCA(sce, ncomponents = 1:5, colour_by = "Group", shape_by = "Group") + scale_color_manual(values = c("cyan", "grey", pal_igv()(2), "orange"))
+plotPCA(sce, ncomponents = 1:5, colour_by = "Plate", shape_by = "Group") 
+plotPCA(sce, ncomponents = 1:5, colour_by = "Reads", shape_by = "Group") 
+plotPCA(sce, ncomponents = 1:5, colour_by = "Mapped", shape_by = "Group") 
+plotPCA(sce, ncomponents = 1:5, colour_by = "Exonic_x", shape_by = "Group") 
+plotPCA(sce, ncomponents = 1:5, colour_by = "GC_x", shape_by = "Group") 
+plotPCA(sce, ncomponents = 1:5, colour_by = "M_F_Kmer", shape_by = "Group") 
+plotPCA(sce, ncomponents = 1:5, colour_by = "MedianInsertSize", shape_by = "Group")
+plotPCA(sce, ncomponents = 1:5, colour_by = "total_features_by_counts_endogenous", shape_by = "Group") 
+plotPCA(sce, ncomponents = 1:5, colour_by = "total_counts_endogenous", shape_by = "Group") 
+plotPCA(sce, ncomponents = 1:5, colour_by = "pct_counts_ERCCs", shape_by = "Group") 
+plotPCA(sce, ncomponents = 1:5, colour_by = "pct_counts_Mito", shape_by = "Group") 
+plotPCA(sce, ncomponents = 1:5, colour_by = "pct_counts_Ribo", shape_by = "Group")
+plotPCA(sce, ncomponents = 1:5, colour_by = "pct_counts_in_top_50_features", shape_by = "Group")
+
+```
+
+# Filtering 
+
+## Cells
+
++ **Clustering on PC1** to remove low quality cells. 
+
++ We use kmeans clustering with the Euclidean distance of PC1 (k = 2).
+
++ Also removed: control cells (SingleCellLysateCtrl, 3PGMouseControl and Blank) and cells with an outlier number of total features (total_features_by_counts)
+
+```{r}
+
+PC1_k <- kmeans(x = dist(sce@reducedDims$PCA[, 1], method = "euclidean"), centers = 2) 
+
+sce$PC1_k2_cluster <- PC1_k$cluster 
+
+plotPCA(sce, ncomponents = 1:2, colour_by = "PC1_k2_cluster", shape_by = "Group") + scale_color_continuous(low = "red3", high = "limegreen")
+
+table(sce@colData[which(sce$PC1_k2_cluster == 2), "Group"])
+
+keep_cells <- sce$PC1_k2_cluster == 2 & !sce$is_cell_control & !isOutlier(sce$total_features_by_counts)
+sce_filtered <-  sce[ , keep_cells]
+
+```
+
+```{r fig.height=4, fig.width=12}
+d2p <- as.data.frame(colData(sce))
+
+g1 <- ggplot(data = d2p, mapping = aes(x = as.factor(PC1_k2_cluster), y = Mapped, shape = Group, col = PC1_k2_cluster, size = total_features_by_counts)) + geom_jitter()  + theme_classic() + scale_color_gradient(low = alpha("red3", .5), high = alpha("limegreen", .5)) + theme(legend.position = "none")
+g2 <- ggplot(data = d2p, mapping = aes(x = as.factor(PC1_k2_cluster), y = total_features_by_counts, shape = Group, col = PC1_k2_cluster, size = total_features_by_counts)) + geom_jitter()  + theme_classic() + scale_color_gradient(low = alpha("red3", .5), high = alpha("limegreen", .5)) + theme(legend.position = "none")
+g3 <- ggplot(data = d2p, mapping = aes(x = as.factor(PC1_k2_cluster), y = pct_counts_in_top_500_features, shape = Group, col = PC1_k2_cluster, size = total_features_by_counts)) + geom_jitter()  + theme_classic() + scale_color_gradient(low = alpha("red3", .5), high = alpha("limegreen", .5)) + theme(legend.position = "none")
+g4 <- ggplot(data = d2p, mapping = aes(x = as.factor(PC1_k2_cluster), y = Exonic_y, shape = Group, col = PC1_k2_cluster, size = total_features_by_counts)) + geom_jitter()  + theme_classic() + scale_color_gradient(low = alpha("red3", .5), high = alpha("limegreen", .5))
+
+
+plot_grid(g1, g2, g3, g4, ncol = 4, rel_widths = c(.5, .5, .5, .8))
+rm(d2p, g1, g2, g3, g4)
+```
+
+
+
+## Features
+
++ Filter out lowly expressed genes. Keep genes expressed in at least 20% of the `r ncol(sce_filtered)` possible cells (i.e. non zero expression in at least `r ncol(sce_filtered)*20/100` cells).
+
++ We also remove ERCC controls at this point. 
+
+
+```{r}
+
+keep_feature <- nexprs(sce_filtered, byrow = TRUE) > ncol(sce_filtered) * 20 / 100 & !rowData(sce_filtered)$is_feature_control_ERCCs
+
+sce_filtered <- sce_filtered[keep_feature, ]
+
+```
+
+## Cells features after filtering
+
++ We end up with `r ncol(sce_filtered)` cells and `r nrow(sce_filtered)`
+
++ The average number of features per cell `r mean(sce_filtered@colData[, "total_features_by_counts"])`
+
+```{r}
+# Note: I already tried to remove genes/features based on their QC features, though I end up removing the most expressed genes.
+# Or use is.outlier function of scater.
+
+#keep_total <- isOutlier(rowData(sce)[, "log10_total_counts_non_control"], nmads = 3, type = "lower", log = TRUE)
+#rowData(x = sce) <- data.frame(rowData(sce), GeneQuality = !keep_total)
+
+#plotRowData(sce, x = "log10_mean_counts", y = "n_cells_by_counts", colour_by = "GeneQuality")
+# Again based on PCA
+
+#corrgram(x = as.matrix(rowData(sce)[, c("mean_counts", "log10_mean_counts", "n_cells_by_counts", "pct_dropout_by_counts", "total_counts", "log10_total_counts", "mean_counts_non_control", "log10_mean_counts_non_control", "n_cells_by_counts_non_control", "pct_dropout_by_counts_non_control", "total_counts_non_control", "log10_total_counts_non_control", "pct_counts_non_control", "mean_counts_cell_control", "log10_mean_counts_cell_control", "n_cells_by_counts_cell_control", "pct_dropout_by_counts_cell_control", "total_counts_cell_control", "log10_total_counts_cell_control", "pct_counts_cell_control", "mean_counts_control", "log10_mean_counts_control", "n_cells_by_counts_control", "pct_dropout_by_counts_control", "total_counts_control", "log10_total_counts_control", "pct_counts_control")]), upper.panel = panel.cor, lower.panel = panel.ellipse)
+
+#corrgram(x = as.matrix(rowData(sce)[, c("mean_counts_non_control", "log10_mean_counts_non_control", "n_cells_by_counts_non_control", "log10_total_counts_non_control", "pct_counts_non_control")]), upper.panel = panel.cor, lower.panel = panel.pts)
+
+#corrgram(x = as.matrix(rowData(sce)[, str_detect(names(rowData(sce)), "log10")]), upper.panel = panel.cor, lower.panel = panel.pts)
+
+#keep_genes <- assess_cell_quality_PCA(features = as.matrix(rowData(sce)[, c("mean_counts", "log10_mean_counts", "n_cells_by_counts", "pct_dropout_by_counts", "total_counts", "log10_total_counts", "mean_counts_non_control", "log10_mean_counts_non_control", "n_cells_by_counts_non_control", "pct_dropout_by_counts_non_control", "total_counts_non_control", "log10_total_counts_non_control", "pct_counts_non_control", "mean_counts_cell_control", "log10_mean_counts_cell_control", "n_cells_by_counts_cell_control", "pct_dropout_by_counts_cell_control", "total_counts_cell_control", "log10_total_counts_cell_control", "pct_counts_cell_control", "mean_counts_control", "log10_mean_counts_control", "n_cells_by_counts_control", "pct_dropout_by_counts_control", "total_counts_control", "log10_total_counts_control", "pct_counts_control")]))
+   
+
+```
+
+# Dopaminergic markers
+
++ We look for the expression of the following dopamineric markers: TH, DDC, SLC6A3, SLC18A2, DRD2, SLC18A2, LMX1A, LMX1B, FOXA2, NR4A2, PITX3, EN1, EN2.
+
++ Only the ones below were kept after filtering.
+
+```{r fig.width=4, fig.height=3}
+
+DAm <- c("TH", "DDC", "SLC6A3", "SLC18A2", "DRD2", "SLC18A2", "LMX1A", "LMX1B", "FOXA2", "NR4A2", "PITX3", "EN1", "EN2")
+DAm <- anots[match(DAm, as.character(anots$GENE_SYMBOL)),  "GENE"]
+DAm <- intersect(DAm, rownames(sce_filtered))
+
+plotExpression(object = sce_filtered, features = DAm, shape_by = "Group", colour_by = DAm[1]) + scale_x_discrete(breaks = DAm, labels = anots[match(DAm, anots$GENE), "GENE_SYMBOL"])
+
+plotExpression(object = sce_filtered, features = DAm, shape_by = "Group", colour_by = "Group") + scale_x_discrete(breaks=DAm, labels=anots[match(DAm, anots$GENE), "GENE_SYMBOL"]) +  scale_color_aaas()
+
+nexprs(object = sce_filtered[DAm, ], detection_limit = 0, exprs_values = "counts", byrow = TRUE)
+
+```
+
+
+# Glutamatergic markers
+
++ In addition of dopaminergic markers, here we show glutamatergic markers: CTIP2 / BCL11B, KA1 / GRIK4, NMDAR1 / GRIN1, OTX1, TBR1.
+
++ We plot them along with dopaminergic markers, and using all features and cells before filtering (otherwise only TBR1 remains)
+
+```{r fig.width=6, fig.height=3}
+#DAm <- c("CTIP2", "KA1", "NMDAR1", "OTX1", "TBR1")
+DAm <- c("TH", "DDC", "SLC6A3", "SLC18A2", "DRD2", "SLC18A2", "LMX1A", "LMX1B", "FOXA2", "NR4A2", "PITX3", "EN1", "EN2", "BCL11B", "GRIK4", "GRIN1", "OTX1", "TBR1")
+
+DAm <- anots[match(DAm, as.character(anots$GENE_SYMBOL)),  "GENE"]
+DAm <- intersect(DAm, rownames(sce))
+
+plotExpression(object = sce, features = DAm, colour_by = "Group") + scale_x_discrete(breaks = DAm, labels = anots[match(DAm, anots$GENE), "GENE_SYMBOL"]) + scale_fill_manual(values = c("cyan", "grey", pal_igv()(2), "orange")) 
+
+```
+
+
+# LRRK2 expression
+
++ Gene expression from all features and cells before filtering.
+
+```{r fig.width=4, fig.height=3}
+DAm <- c("LRRK2")
+
+DAm <- anots[match(DAm, as.character(anots$GENE_SYMBOL)),  "GENE"]
+DAm <- intersect(DAm, rownames(sce))
+
+plotExpression(object = sce, features = DAm, colour_by = "Group", size = "ENSG00000188906.15") + scale_x_discrete(breaks = DAm, labels = anots[match(DAm, anots$GENE), "GENE_SYMBOL"]) + scale_fill_manual(values = c("cyan", "grey", pal_igv()(2), "orange")) 
+
+```
+
+
+# Cell specific markers
+
++ Gene expression from all features and cells before filtering.
+
+```{r fig.width=6, fig.height=3}
+DAm <- c("TH", "DDC", "SLC6A3", "SLC18A2", "DRD2", "SLC18A2", "LMX1A", "LMX1B", "FOXA2", "NR4A2", "PITX3", "EN1", "EN2", "GFAP", "S100B", "AQP4", "GJA1", "C1QB","CCL4","CCL3","IBA1", "PLP1", "MOBP", "PDFGRA", "GAD1", "GAD2", "VIP", "RELN")
+
+DAm <- anots[match(DAm, as.character(anots$GENE_SYMBOL)),  "GENE"]
+DAm <- intersect(DAm, rownames(sce))
+
+plotExpression(object = sce, features = DAm, colour_by = "Group") + scale_x_discrete(breaks = DAm, labels = anots[match(DAm, anots$GENE), "GENE_SYMBOL"]) + scale_fill_manual(values = c("cyan", "grey", pal_igv()(2), "orange")) 
+
+```
+
+
+# Re-calculate PC
+
+## Scater PCs
+
++ Principal component analysis based on top 1000 variable genes
+
+```{r }
+sce_filtered <- runPCA(sce_filtered, ncomponents = 20, ntop = 1000)
+
+d2p <- data.frame(colData(sce_filtered), reducedDim(sce_filtered)[, c("PC1", "PC2", "PC3", "PC4", "PC5", "PC6", "PC7", "PC8", "PC9", "PC10", "PC11", "PC12", "PC13", "PC14", "PC15", "PC16", "PC17", "PC18", "PC19", "PC20")])
+
+for (i in 1:20){
+  ggi <- ggplot(data = d2p, mapping = aes_string(x = "Group", y = paste("PC", i, sep = ""), fill = "Group")) + geom_violin() + geom_jitter(width = .2) + theme_classic() + scale_fill_igv() + theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+  assign(x =  paste("gg_PC", i, sep = ""), value = ggi)
+}
+
+save(sce_filtered, file = "Filtered_GeneExpressionData_v2.Robj")
+```
+
+### PCs by Group
+
+```{r fig.height=12, fig.width=10}
+
+plot_grid(gg_PC1, gg_PC2, gg_PC3, gg_PC4, gg_PC5, gg_PC6, gg_PC7, gg_PC8, gg_PC9, gg_PC10,
+          gg_PC11, gg_PC12, gg_PC13, gg_PC14, gg_PC15, gg_PC16, gg_PC17, gg_PC18, gg_PC19, gg_PC20,
+          ncol = 5)
+
+rm(gg_PC1, gg_PC2, gg_PC3, gg_PC4, gg_PC5, gg_PC6, gg_PC7, gg_PC8, gg_PC9, gg_PC10, gg_PC11, gg_PC12, gg_PC13, gg_PC14, gg_PC15, gg_PC16, gg_PC17, gg_PC18, gg_PC19, gg_PC20)
+
+```
+
+### Explanatory variables by PC
+
+```{r}
+plotExplanatoryPCs(sce_filtered, npcs_to_plot = 10) + scale_color_d3(palette = "category20") + geom_abline(intercept = 10, slope = 0)
+
+
+plotExplanatoryPCs(sce_filtered, variables = c("pct_counts_in_top_50_features_Ribo", "pct_counts_ERCCs", "pct_counts_in_top_100_features_feature_control", "log10_total_counts_ERCCs", "total_counts_ERCCs", "pct_counts_in_top_200_features", "Group"), npcs_to_plot = 10) + scale_color_d3(palette = "category20") + geom_abline(intercept = 10, slope = 0)
+
+plotExplanatoryPCs(sce_filtered, variables = c("Group", "total_counts_endogenous", "total_features_by_counts", "pct_counts_in_top_50_features_Ribo", "pct_counts_ERCCs"), npcs_to_plot = 10) + scale_color_d3(palette = "category20")
+
+```
+
+### Corrgram
+
+```{r fig.height=10, fig.width=10}
+d2p <- data.frame(colData(sce_filtered)[, c("pct_counts_in_top_50_features_Ribo", "pct_counts_ERCCs", "pct_counts_in_top_100_features_feature_control", "pct_counts_in_top_200_features")], reducedDim(sce_filtered)[, c("PC1", "PC2")])
+panel.pts2 <- function (x, y, corr = NULL, col.regions, cor.method, ...) {
+    if (!is.null(corr)) 
+        return()
+    plot.xy(xy.coords(x, y), type = "p", pch = 16, col = alpha("black", 0.7), cex = .9, ...)
+    box(col = "lightgray")
+}
+corrgram::corrgram(d2p, upper.panel = panel.pts2, lower.panel = panel.cor, cex.labels = 1.3, label.pos = c(.5, .5))
+
+```
+
+
+### First 3 PC by metadata
+
+```{r fig.height=7, fig.width=8}
+gg0 <- plotPCA(sce_filtered, ncomponents = 1:3, colour_by = "Group", shape_by = "Group") 
+gg0 <- gg0 + scale_color_igv()
+gg0
+
+plotPCA(sce_filtered, ncomponents = 1:3, colour_by = "pct_counts_in_top_50_features_Ribo", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = 1:3, colour_by = "pct_counts_ERCCs", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = 1:3, colour_by = "pct_counts_in_top_100_features_feature_control", shape_by = "Group")
+plotPCA(sce_filtered, ncomponents = 1:3, colour_by = "log10_total_counts_ERCCs", shape_by = "Group")
+plotPCA(sce_filtered, ncomponents = 1:3, colour_by = "total_counts_ERCCs", shape_by = "Group")
+plotPCA(sce_filtered, ncomponents = 1:3, colour_by = "pct_counts_in_top_200_features", shape_by = "Group")
+
+plotPCA(sce_filtered, ncomponents = 1:3, colour_by = "Plate", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = 1:3, colour_by = "Reads", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = 1:3, colour_by = "Mapped", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = 1:3, colour_by = "Exonic_x", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = 1:3, colour_by = "GC_x", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = 1:3, colour_by = "M_F_Kmer", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = 1:3, colour_by = "MedianInsertSize", shape_by = "Group")
+
+plotPCA(sce_filtered, ncomponents = 1:3, colour_by = "total_features_by_counts_endogenous", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = 1:3, colour_by = "total_counts_endogenous", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = 1:3, colour_by = "pct_counts_ERCCs", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = 1:3, colour_by = "pct_counts_Mito", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = 1:3, colour_by = "pct_counts_Ribo", shape_by = "Group")
+plotPCA(sce_filtered, ncomponents = 1:3, colour_by = "pct_counts_in_top_50_features", shape_by = "Group")
+
+rm(gg0)
+```
+
+### Selected components 
+
++ That broadly separate the data by group.
+
+```{r fig.height=8, fig.width=9}
+gg1 <- plotPCA(sce_filtered, ncomponents = c(1, 8, 11, 12, 19), colour_by = "Group", shape_by = "Group") 
+gg1 <- gg1 + scale_color_igv()
+gg1
+
+
+gg1 <- ggplot(data = d2p, mapping = aes(x = PC1, y = PC2, color = Group, size = Exonic_x )) + geom_point() + scale_color_igv()
+
+plotPCA(sce_filtered, ncomponents = c(1, 8, 11, 12, 19), colour_by = "pct_counts_in_top_50_features_Ribo", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = c(1, 8, 11, 12, 19), colour_by = "pct_counts_ERCCs", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = c(1, 8, 11, 12, 19), colour_by = "pct_counts_in_top_100_features_feature_control", shape_by = "Group")
+plotPCA(sce_filtered, ncomponents = c(1, 8, 11, 12, 19), colour_by = "log10_total_counts_ERCCs", shape_by = "Group")
+plotPCA(sce_filtered, ncomponents = c(1, 8, 11, 12, 19), colour_by = "total_counts_ERCCs", shape_by = "Group")
+plotPCA(sce_filtered, ncomponents = c(1, 8, 11, 12, 19), colour_by = "pct_counts_in_top_200_features", shape_by = "Group")
+
+
+plotPCA(sce_filtered, ncomponents = c(1, 8, 11, 12, 19), colour_by = "Plate", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = c(1, 8, 11, 12, 19), colour_by = "Reads", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = c(1, 8, 11, 12, 19), colour_by = "Mapped", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = c(1, 8, 11, 12, 19), colour_by = "Exonic_x", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = c(1, 8, 11, 12, 19), colour_by = "GC_x", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = c(1, 8, 11, 12, 19), colour_by = "M_F_Kmer", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = c(1, 8, 11, 12, 19), colour_by = "MedianInsertSize", shape_by = "Group")
+
+plotPCA(sce_filtered, ncomponents = c(1, 8, 11, 12, 19), colour_by = "total_features_by_counts_endogenous", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = c(1, 8, 11, 12, 19), colour_by = "total_counts_endogenous", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = c(1, 8, 11, 12, 19), colour_by = "pct_counts_ERCCs", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = c(1, 8, 11, 12, 19), colour_by = "pct_counts_Mito", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = c(1, 8, 11, 12, 19), colour_by = "pct_counts_Ribo", shape_by = "Group")
+plotPCA(sce_filtered, ncomponents = c(1, 8, 11, 12, 19), colour_by = "pct_counts_in_top_50_features", shape_by = "Group")
+
+rm(gg1)
+```
+
+## PC all features
+
++ Principal component analysis based on top **ALL** variable genes
+
+```{r}
+sce_filtered <- runPCA(sce_filtered, ncomponents = 20, ntop = nrow(sce_filtered))
+
+d2p <- data.frame(colData(sce_filtered), reducedDim(sce_filtered)[, c("PC1", "PC2", "PC3", "PC4", "PC5", "PC6", "PC7", "PC8", "PC9", "PC10", "PC11", "PC12", "PC13", "PC14", "PC15", "PC16", "PC17", "PC18", "PC19", "PC20")])
+
+for (i in 1:20){
+  ggi <- ggplot(data = d2p, mapping = aes_string(x = "Group", y = paste("PC", i, sep = ""), fill = "Group")) + geom_violin() + geom_jitter(width = .2) + theme_classic() + scale_fill_igv() + theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+  assign(x =  paste("gg_PC", i, sep = ""), value = ggi)
+}
+
+```
+
+### PCs by Group
+
+```{r fig.height=12, fig.width=10}
+
+plot_grid(gg_PC1, gg_PC2, gg_PC3, gg_PC4, gg_PC5, gg_PC6, gg_PC7, gg_PC8, gg_PC9, gg_PC10,
+          gg_PC11, gg_PC12, gg_PC13, gg_PC14, gg_PC15, gg_PC16, gg_PC17, gg_PC18, gg_PC19, gg_PC20,
+          ncol = 5)
+
+rm(gg_PC1, gg_PC2, gg_PC3, gg_PC4, gg_PC5, gg_PC6, gg_PC7, gg_PC8, gg_PC9, gg_PC10, gg_PC11, gg_PC12, gg_PC13, gg_PC14, gg_PC15, gg_PC16, gg_PC17, gg_PC18, gg_PC19, gg_PC20)
+
+```
+
+### Explanatory variables by PC
+
+```{r}
+plotExplanatoryPCs(sce_filtered, npcs_to_plot = 10) + scale_color_d3(palette = "category20") + geom_abline(intercept = 10, slope = 0)
+
+
+plotExplanatoryPCs(sce_filtered, variables = c("pct_counts_in_top_50_features_Ribo", "pct_counts_ERCCs", "pct_counts_in_top_500_features_endogenous", "total_features_by_counts_endogenous", "log10_total_counts_ERCCs", "total_features_by_counts", "Plate", "Group"), npcs_to_plot = 10) + scale_color_d3(palette = "category20") + geom_abline(intercept = 10, slope = 0)
+
+#plotExplanatoryPCs(sce_filtered, variables = c("Group", "total_counts_endogenous", "total_features_by_counts", "pct_counts_in_top_50_features_Ribo", "pct_counts_ERCCs"), npcs_to_plot = 10) + scale_color_d3(palette = "category20")
+
+```
+
+### Corrgram
+
++ pct_counts_in_top_50_features_Ribo, pct_counts_ERCCs, pct_counts_in_top_500_features_endogenous, total_features_by_counts_endogenous, log10_total_counts_ERCCs, total_features_by_counts, Plate
+
+```{r fig.height=10, fig.width=10}
+d2p <- data.frame(colData(sce_filtered)[, c("pct_counts_in_top_50_features_Ribo", "pct_counts_ERCCs", "pct_counts_in_top_500_features_endogenous", "total_features_by_counts_endogenous", "log10_total_counts_ERCCs", "total_features_by_counts")], reducedDim(sce_filtered)[, c("PC1", "PC2", "PC3", "PC4", "PC5")])
+panel.pts2 <- function (x, y, corr = NULL, col.regions, cor.method, ...) {
+    if (!is.null(corr)) 
+        return()
+    plot.xy(xy.coords(x, y), type = "p", pch = 16, col = alpha("black", 0.7), cex = .9, ...)
+    box(col = "lightgray")
+}
+corrgram::corrgram(d2p, upper.panel = panel.pts2, lower.panel = panel.cor, cex.labels = 1.3, label.pos = c(.5, .5))
+
+```
+
+
+
+### First 5 PC by metadata
+
+```{r fig.height=8, fig.width=9}
+gg0 <- plotPCA(sce_filtered, ncomponents = 1:5, colour_by = "Group", shape_by = "Group") 
+gg0 <- gg0 + scale_color_igv()
+gg0
+
+plotPCA(sce_filtered, ncomponents = 1:5, colour_by = "pct_counts_in_top_50_features_Ribo", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = 1:5, colour_by = "pct_counts_ERCCs", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = 1:5, colour_by = "pct_counts_in_top_500_features_endogenous", shape_by = "Group")
+plotPCA(sce_filtered, ncomponents = 1:5, colour_by = "total_features_by_counts_endogenous", shape_by = "Group")
+plotPCA(sce_filtered, ncomponents = 1:5, colour_by = "log10_total_counts_ERCCs", shape_by = "Group")
+plotPCA(sce_filtered, ncomponents = 1:5, colour_by = "total_features_by_counts", shape_by = "Group")
+
+plotPCA(sce_filtered, ncomponents = 1:5, colour_by = "Plate", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = 1:5, colour_by = "Reads", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = 1:5, colour_by = "Mapped", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = 1:5, colour_by = "Exonic_x", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = 1:5, colour_by = "GC_x", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = 1:5, colour_by = "M_F_Kmer", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = 1:5, colour_by = "MedianInsertSize", shape_by = "Group")
+
+plotPCA(sce_filtered, ncomponents = 1:5, colour_by = "total_features_by_counts_endogenous", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = 1:5, colour_by = "total_counts_endogenous", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = 1:5, colour_by = "pct_counts_ERCCs", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = 1:5, colour_by = "pct_counts_Mito", shape_by = "Group") 
+plotPCA(sce_filtered, ncomponents = 1:5, colour_by = "pct_counts_Ribo", shape_by = "Group")
+plotPCA(sce_filtered, ncomponents = 1:5, colour_by = "pct_counts_in_top_50_features", shape_by = "Group")
+
+rm(gg0)
+```
+
+
+# Counts by sequencing depth
+
++ Check out relationship between expressed counts and reads / counts and sequencing depth.
+
+```{r fig.height=12, fig.width=9} 
+mediana <- apply(counts(sce_filtered), 1, function(x) mean(x[which(x != 0)]))
+#head(mediana[order(mediana, decreasing = TRUE)])
+aver <- cut(x = mediana, breaks = quantile(mediana, probs = seq(0, 1, .1)), labels = c(1:10))
+
+c1 <- levels(aver)
+
+par(mfrow = c(4, 3))
+for (i in c(1:10)){
+  counts_i <- colSums(counts(sce_filtered[which(aver == c1[i]), ]))
+  plot(counts_i, sce_filtered$Reads, pch = 16, xlab = paste("counts decile", i), ylab = "Reads")
+  abline(lm(sce_filtered$Reads ~  counts_i), lty = 2, col = "red")
+  legend("topright", legend = paste("r = ", signif(cor.test(counts_i, sce_filtered$Reads)$estimate, 4)), bty = "n")
+}
+
+
+#cuentas <- counts(sce_filtered)
+#colnames(cuentas) <- paste("cell", 1:ncol(cuentas), sep = "_")
+
+#cuentas_por_millon <- cpm(sce_filtered)
+#colnames(cuentas_por_millon) <- paste("cell", 1:ncol(cuentas_por_millon), sep = "_")
+
+#aver2 <- plotCountDepth(Data = cuentas, Conditions = sce_filtered$Group)
+#aver3 <- plotCountDepth(Data = cuentas, NormalizedData = cuentas_por_millon, Conditions = sce_filtered$Group)
+
+#normdata <- SCnorm(Data = cuentas, Conditions = sce_filtered$Group)
+
+## PCs
+#pcs <- prcomp(x = t(apply(logcounts(sce_filtered), 1, scale)), center = TRUE, scale. = TRUE)
+#plot(pcs$rotation[, 1], pcs$rotation[, 2])
+
+```
+
+
